@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  David Alvarez | This is the Way
+Parameters:
+    EnvironmentName:
+      Description: An environment name
+      Type: String
+    ImageId:
+      Description: ID of machine amazon (AMI)
+      Type: String
+    InstanceType:
+      Description: Type of EC2 instance
+      Type: String
+    VolumeSize:
+      Description: Volume size of EC2 instance
+      Type: String
+Resources:
+    BastionHostSecGroup:
+      Type: "AWS::EC2::SecurityGroup"
+      Properties:
+        GroupDescription: Allow SSH to Bastion Host
+        VpcId:
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 0
+            ToPort: 65535
+            CidrIp: 0.0.0.0/0
+    WebServerSecGroup:
+      Type: "AWS::EC2::SecurityGroup"
+      Properties:
+        GroupDescription: Allow HTTP to Web Servers
+        VpcId:
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          # Enable if you want ssh access to Web Servers
+          # - IpProtocol: tcp
+          #   FromPort: 22
+          #   ToPort: 22
+          #   CidrIp: 0.0.0.0/0           
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 0
+            ToPort: 65535
+            CidrIp: 0.0.0.0/0
+    LBSecGroup:
+      Type: "AWS::EC2::SecurityGroup"
+      Properties:
+        GroupDescription: Allow HTTP to load balancer
+        VpcId:
+          Fn::ImportValue:
+            !Sub "${EnvironmentName}-VPCID"
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+    ProfileWithRolesForOurApp:
+      Type: AWS::IAM::InstanceProfile
+      Properties: 
+        Roles:
+          - UdacityS3ReadOnlyEC2
+    WebAppLaunchConfig:
+      Type: "AWS::AutoScaling::LaunchConfiguration"
+      Properties:
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install unzip awscli -y
+            apt-get install apache2 -y
+            systemctl start apache2.service
+            cd /var/www/html
+            aws s3 cp s3://udacity-demo-1/udacity.zip .
+            unzip -o udacity.zip 
+        ImageId: !Ref ImageId
+        SecurityGroups:
+          - Ref: WebServerSecGroup
+        IamInstanceProfile: 
+          Ref: ProfileWithRolesForOurApp
+        InstanceType: !Ref InstanceType
+        # KeyName: <name_of_your_key>
+        BlockDeviceMappings:
+          - DeviceName: "/dev/sdk"
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+    WebAppGroup:
+      Type: "AWS::AutoScaling::AutoScalingGroup"
+      Properties:
+        VPCZoneIdentifier:
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}-PRIV-NETS"
+        LaunchConfigurationName: 
+          Ref: WebAppLaunchConfig
+        MinSize: '4'
+        MaxSize: '8'
+        TargetGroupARNs:
+        - Ref: WebAppTargetGroup    
+    WebAppLB:
+      Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+      Properties:
+        Subnets:
+          - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+          - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+        SecurityGroups:
+          - Ref: LBSecGroup
+    Listener:
+      Type: "AWS::ElasticLoadBalancingV2::Listener"
+      Properties:
+        DefaultActions: #required
+          - Type: forward
+            TargetGroupArn:
+              Ref: WebAppTargetGroup
+        LoadBalancerArn: #required
+          Ref: WebAppLB
+        Port: '80' #required
+        Protocol: HTTP #required
+    ALBListenerRule:
+      Type: "AWS::ElasticLoadBalancingV2::ListenerRule"
+      Properties:
+        Actions: #required
+          - Type: forward
+            TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions: #required
+          - Field: path-pattern
+            Values: [/]
+        ListenerArn: !Ref 'Listener' #required
+        Priority: 1 #required
+    WebAppTargetGroup:
+      Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+      Properties:
+        HealthCheckIntervalSeconds: 10
+        HealthCheckPath: /
+        HealthCheckProtocol: HTTP
+        HealthCheckTimeoutSeconds: 8
+        HealthyThresholdCount: 2
+        Port: 80
+        Protocol: HTTP
+        UnhealthyThresholdCount: 5
+        VpcId:
+          Fn::ImportValue:
+            Fn::Sub: "${EnvironmentName}-VPCID"
+    BastionHostLaunchConfig:
+      Type: "AWS::AutoScaling::LaunchConfiguration"
+      Properties:
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+        ImageId: !Ref ImageId
+        KeyName: this-is-the-way
+        SecurityGroups:
+          - Ref: BastionHostSecGroup
+        InstanceType: !Ref InstanceType
+    BastionHostGroup:
+      Type: "AWS::AutoScaling::AutoScalingGroup"
+      Properties:
+        VPCZoneIdentifier:
+          - Fn::ImportValue:
+              !Sub "${EnvironmentName}-PUB-NETS"
+        LaunchConfigurationName: 
+          Ref: BastionHostLaunchConfig
+        MinSize: '2'
+        MaxSize: '4' 
+
+Outputs:
+
+    WebAppDNSName:
+      Description: Web target group
+      Value: !Sub "http://${WebAppLB.DNSName}"
+      Export: 
+        Name: !Sub "${EnvironmentName}-DNSName"
